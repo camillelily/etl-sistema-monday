@@ -1,0 +1,244 @@
+function fazerLoginQBEM() {
+
+  const url = "https://eb.qbem.net.br/Autenticacao";
+
+  const payload = {
+    ReturnUrl: "/",
+    Email: "EMAIL",
+    Senha: "SENHA"
+  };
+
+  const resposta = UrlFetchApp.fetch(url, {
+    method: "post",
+    payload: payload,
+    followRedirects: false,
+    muteHttpExceptions: true
+  });
+
+  Logger.log("Status login: " + resposta.getResponseCode());
+
+  const cookies = resposta.getAllHeaders()["Set-Cookie"];
+
+  let cookieFinal = "";
+
+  cookies.forEach(c => {
+    let partes = c.split(";")[0];
+    const nome = partes.split("=")[0];
+
+    if (
+      nome === "session" ||
+      nome === "EBSProd" ||
+      nome === "ARRAffinity" ||
+      nome === "ARRAffinitySameSite"
+    ) {
+      cookieFinal += partes + "; ";
+    }
+  });
+
+  Logger.log("Cookie final tamanho: " + cookieFinal.length);
+
+  return cookieFinal;
+}
+
+function testarPaginaQBEM() {
+
+  const cookie = fazerLoginQBEM();
+
+
+  const url = "https://eb.qbem.net.br/PerfilDados/Editar/8054";
+
+
+  const resposta = UrlFetchApp.fetch(url, {
+
+    method: "get",
+
+    headers: {
+      "Cookie": cookie
+    },
+
+    followRedirects: false,
+
+    muteHttpExceptions: true
+
+  });
+
+
+  Logger.log("Status página: " + resposta.getResponseCode());
+
+  Logger.log(
+    resposta.getContentText().substring(0,500)
+  );
+
+}
+
+function pegarPerfisQBEM() {
+  const cookie = fazerLoginQBEM();
+  const url = "https://eb.qbem.net.br/PerfilDados/Index";
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { "Cookie": cookie },
+    muteHttpExceptions: true
+  });
+
+  const html = response.getContentText();
+
+  // Separa cada linha <tr> da tabela
+  const linhasHtml = html.match(/<tr[^>]*role="row"[^>]*>[\s\S]*?<\/tr>/g) || [];
+
+  const dados = [];
+
+  linhasHtml.forEach(linha => {
+    const idMatch = linha.match(/<td>(\d+)<\/td>/);
+    const descMatch = linha.match(/<td style="max-width:\s*150px[^"]*"[^>]*>([^<]*)<\/td>/);
+    const estipMatch = linha.match(/<td style="max-width:\s*500px[^"]*"[^>]*>([\s\S]*?)<\/td>/);
+    const statusMatch = linha.match(/<span class="label[^"]*">([^<]*)<\/span>/);
+
+    if (idMatch && descMatch) {
+      dados.push([
+        idMatch[1],
+        descMatch[1].trim(),
+        estipMatch ? estipMatch[1].replace(/<[^>]+>/g, "").trim() : "",
+        statusMatch ? statusMatch[1].trim() : ""
+      ]);
+    }
+  });
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("QBEM");
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, 4).setValues([["ID", "Descrição (Gerente)", "Estipulantes", "Status"]]);
+  if (dados.length > 0) {
+    sheet.getRange(2, 1, dados.length, 4).setValues(dados);
+  }
+
+  Logger.log("Total de perfis extraídos: " + dados.length);
+}
+
+function ativarEstipulantesDaPlanilha(idPerfil, nomeAbaLista) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(nomeAbaLista);
+  const dados = sheet.getDataRange().getValues();
+  const linhasSemCabecalho = dados.slice(1); // pula o cabeçalho
+
+  const empresasParaAtivar = linhasSemCabecalho
+    .map(linha => linha[0]) // coluna A
+    .filter(nome => nome); // ignora vazias
+
+  ativarEstipulantesQBEM(idPerfil, empresasParaAtivar);
+} 
+
+function pegarEstipulantesAtivas(idPerfil) {
+  const cookie = fazerLoginQBEM();
+  const url = "https://eb.qbem.net.br/PerfilDados/Editar/" + idPerfil;
+
+  const resposta = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { "Cookie": cookie },
+    muteExceptions: true
+  });
+
+  const html = resposta.getContentText();
+
+  const idxTabela = html.indexOf('id="tbEstipulantes"');
+  const idxTbody = html.indexOf("<tbody", idxTabela);
+  const idxTbodyFim = html.indexOf("</tbody>", idxTbody);
+
+  const htmlTabela = html.substring(idxTbody, idxTbodyFim);
+
+  const linhas = htmlTabela.match(/<tr>[\s\S]*?<\/tr>/g) || [];
+
+  const ativas = [];
+
+  linhas.forEach(linha => {
+
+    const isAtiva =
+      /name="Estipulantes\[\d+\]\.Selecionado"[^>]*checked="checked"/.test(linha)
+      ||
+      /checked="checked"[^>]*name="Estipulantes\[\d+\]\.Selecionado"/.test(linha);
+
+    if (!isAtiva) return;
+
+
+    const idMatch = linha.match(
+      /name="Estipulantes\[\d+\]\.idEstipulante"[^>]*value="(\d+)"/
+    );
+
+
+    const nomeMatch = linha.match(
+      /name="Estipulantes\[\d+\]\.Nome"[^>]*value="([^"]*)"/
+    );
+
+
+    if (idMatch && nomeMatch) {
+
+      const nome = nomeMatch[1]
+        .replace(/&#32;/g, " ")
+        .replace(/&amp;/g, "&");
+
+
+      ativas.push([
+        idMatch[1],
+        nome
+      ]);
+
+    }
+
+  });
+
+
+  Logger.log(
+    "Perfil " + idPerfil +
+    " — Total de linhas: " + linhas.length +
+    " | Ativas: " + ativas.length
+  );
+
+
+  const nomeAba = "Estipulantes" + idPerfil;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const sheet = ss.getSheetByName(nomeAba)
+    || ss.insertSheet(nomeAba);
+
+
+  sheet.clearContents();
+
+
+  sheet.getRange(1,1,1,2)
+    .setValues([
+      ["ID Estipulante", "Nome - CNPJ"]
+    ]);
+
+
+  if (ativas.length > 0) {
+
+    sheet.getRange(
+      2,
+      1,
+      ativas.length,
+      2
+    ).setValues(ativas);
+
+  }
+
+
+  return ativas;
+}
+
+// função "atalho" do GERENTE1
+function pegarPerfil8054() {
+  pegarEstipulantesAtivas(IDPERFIL);
+}
+
+// função "atalho" do GERENTE2
+function pegarPerfil8055() {
+  pegarEstipulantesAtivas(IDPERFIL);
+}
+
+// função "atalho" do GERENTE3
+function pegarPerfil8089() {
+  pegarEstipulantesAtivas(IDPERFIL);
+}
+
+function limparCnpj_(cnpj) {
+  return String(cnpj).replace(/\D/g, "");
+}
