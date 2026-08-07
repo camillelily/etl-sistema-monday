@@ -1,0 +1,315 @@
+function configurarToken() {
+  const TOKEN = "TOKEN_API";
+  PropertiesService.getScriptProperties().setProperty("MONDAY_TOKEN", TOKEN);
+  Logger.log("Token salvo com segurança em Script Properties.");
+}
+
+function getMondayToken_() {
+  const token = PropertiesService.getScriptProperties().getProperty("MONDAY_TOKEN");
+  if (!token) {
+    throw new Error("MONDAY_TOKEN não configurado. Rode configurarToken() primeiro.");
+  }
+  return token;
+}
+
+const BOARD_ID = 18413848442;
+
+function chamarMonday_(query) {
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: getMondayToken_() },
+    payload: JSON.stringify({ query: query }),
+    muteHttpExceptions: true
+  };
+
+  const resposta = UrlFetchApp.fetch("https://api.monday.com/v2", options);
+  const json = JSON.parse(resposta.getContentText());
+
+  if (json.errors) {
+    throw new Error("Erro na API do Monday: " + JSON.stringify(json.errors));
+  }
+
+  return json.data;
+}
+
+function pegarColunasBoard_() {
+  const query = `
+    query {
+      boards(ids: [${BOARD_ID}]) {
+        columns {
+          id
+          title
+        }
+      }
+    }
+  `;
+  const data = chamarMonday_(query);
+  const todasColunas = data.boards[0].columns;
+
+  const palavrasChave = ["estipulante", "cnpj", "apolice", "apólice"];
+
+  return todasColunas.filter(col => {
+    const tituloNormalizado = col.title
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, ""); // remove acentos pra comparar
+    return palavrasChave.some(palavra =>
+      tituloNormalizado.includes(
+        palavra.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      )
+    );
+  });
+}
+
+function pegarGruposBoard_() {
+  const query = `
+    query {
+      boards(ids: [${BOARD_ID}]) {
+        groups {
+          id
+          title
+        }
+      }
+    }
+  `;
+  const data = chamarMonday_(query);
+  return data.boards[0].groups;
+}
+
+function pegarItensDoGrupo_(groupId) {
+  const itens = [];
+  let cursor = null;
+  let primeiraPagina = true;
+
+  while (primeiraPagina || cursor) {
+    primeiraPagina = false;
+
+    let query;
+    if (!cursor) {
+      // Primeira chamada: filtra pelo grupo
+      query = `
+        query {
+          boards(ids: [${BOARD_ID}]) {
+            groups(ids: ["${groupId}"]) {
+              items_page(limit: 100) {
+                cursor
+                items {
+                  id
+                  name
+                  column_values {
+                    id
+                    text
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+    } else {
+      // Páginas seguintes: usa next_items_page com o cursor específico deste grupo
+      query = `
+        query {
+          next_items_page(limit: 100, cursor: "${cursor}") {
+            cursor
+            items {
+              id
+              name
+              column_values {
+                id
+                text
+              }
+            }
+          }
+        }
+      `;
+    }
+
+    const data = chamarMonday_(query);
+    const itemsPage = cursor
+      ? data.next_items_page
+      : data.boards[0].groups[0].items_page;
+
+    itemsPage.items.forEach(item => itens.push(item));
+    cursor = itemsPage.cursor || null;
+  }
+
+  return itens;
+}
+
+function pegarItensDoBoard_() {
+  const colunas = pegarColunasBoard_();
+  const grupos = pegarGruposBoard_();
+  const itensFinal = [];
+
+  grupos.forEach(grupo => {
+    const itensDoGrupo = pegarItensDoGrupo_(grupo.id);
+    itensDoGrupo.forEach(item => {
+      itensFinal.push({
+        grupo: grupo.title,
+        nome: item.name,
+        colunas: item.column_values
+      });
+    });
+  });
+
+  return { colunas, itens: itensFinal };
+}
+
+// Puxa tudo
+function puxarDadosMonday() {
+  const { colunas, itens } = pegarItensDoBoard_();
+  escreverNaPlanilha_(colunas, itens);
+}
+
+function puxarDadosDoGerente_(nomeGerente) {
+  const grupos = pegarGruposBoard_();
+  const grupo = grupos.find(
+    g => g.title.trim().toUpperCase() === nomeGerente.trim().toUpperCase()
+  );
+
+  if (!grupo) {
+    Logger.log('Gerente/grupo "' + nomeGerente + '" não encontrado no Monday.');
+    return;
+  }
+
+  const colunas = pegarColunasBoard_();
+  const itensDoGrupo = pegarItensDoGrupo_(grupo.id);
+
+  const itens = itensDoGrupo.map(item => ({
+    grupo: grupo.title,
+    nome: item.name,
+    colunas: item.column_values
+  }));
+
+  escreverNaPlanilha_(colunas, itens);
+
+  Logger.log('Concluído. ' + itens.length + ' item(ns) de "' + grupo.title + '" adicionados.');
+}
+
+// Atalhos por gerente — preencha o nome exato do grupo no Monday em cada função
+function puxar_GERENTE1() {
+  puxarDadosDoGerente_("NOME DO GERENTE 1");
+}
+
+function puxar_GERENTE2() {
+  puxarDadosDoGerente_("NOME DO GERENTE 2");
+}
+
+function escreverNaPlanilha_(colunas, itens) {
+  const planilha = SpreadsheetApp.getActiveSpreadsheet();
+  let aba = planilha.getSheetByName("Monday") || planilha.insertSheet("Monday");
+  aba.clear();
+
+  const cabecalho = ["Gerente/Grupo", "Item"].concat(colunas.map(c => c.title));
+  const linhas = [cabecalho];
+
+  itens.forEach(item => {
+    const linha = [item.grupo, item.nome];
+    colunas.forEach(col => {
+      const valor = item.colunas.find(cv => cv.id === col.id);
+      linha.push(valor ? (valor.text || "") : "");
+    });
+    linhas.push(linha);
+  });
+
+  aba.getRange(1, 1, linhas.length, cabecalho.length).setValues(linhas);
+
+  Logger.log("Concluído. Total de itens puxados: " + itens.length);
+}
+
+// Localiza a coluna de status/situação (ativo/inativo)
+function pegarColunaStatus_() {
+  const query = `
+    query {
+      boards(ids: [${BOARD_ID}]) {
+        columns {
+          id
+          title
+        }
+      }
+    }
+  `;
+  const data = chamarMonday_(query);
+  const todasColunas = data.boards[0].columns;
+
+  const palavrasChaveStatus = ["Status apólice"];
+
+  const colunaStatus = todasColunas.find(col => {
+    const tituloNormalizado = col.title
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+    return palavrasChaveStatus.some(palavra =>
+      tituloNormalizado.includes(
+        palavra.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      )
+    );
+  });
+
+  if (!colunaStatus) {
+    throw new Error("Coluna de status não encontrada. Verifique o título da coluna no board.");
+  }
+
+  return colunaStatus;
+}
+
+// Verifica se o item está marcado como ativo
+function itemEstaAtivo_(item, colStatusId) {
+  const valorStatus = item.column_values.find(cv => cv.id === colStatusId);
+  if (!valorStatus || !valorStatus.text) return false;
+
+  const textoNormalizado = valorStatus.text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+
+  // Considera ativo se o texto começar com "ativo" e NÃO for "inativo"
+  return textoNormalizado === "ativo";
+}
+
+// Filtra a lista de itens, mantendo só os ativos
+function filtrarItensAtivos_(itens) {
+  const colStatus = pegarColunaStatus_();
+  return itens.filter(item => itemEstaAtivo_(item, colStatus.id));
+}
+
+// Versão de puxarDadosMonday() só com estipulantes ativas
+function puxarDadosMondayAtivos() {
+  const { colunas, itens } = pegarItensDoBoard_();
+  const itensAtivos = filtrarItensAtivos_(itens);
+  escreverNaPlanilha_(colunas, itensAtivos);
+  Logger.log("Concluído. Itens ativos puxados: " + itensAtivos.length + " de " + itens.length + " totais.");
+}
+
+// Versão de puxarDadosDoGerente_() só com estipulantes ativas
+function puxarDadosDoGerenteAtivos_(nomeGerente) {
+  const grupos = pegarGruposBoard_();
+  const grupo = grupos.find(
+    g => g.title.trim().toUpperCase() === nomeGerente.trim().toUpperCase()
+  );
+
+  if (!grupo) {
+    Logger.log('Gerente/grupo "' + nomeGerente + '" não encontrado no Monday.');
+    return;
+  }
+
+  const colunas = pegarColunasBoard_();
+  const itensDoGrupo = pegarItensDoGrupo_(grupo.id);
+
+  // Para filtrar precisamos do formato original (com column_values), então filtramos antes de mapear
+  const colStatus = pegarColunaStatus_();
+  const itensAtivos = itensDoGrupo
+    .filter(item => itemEstaAtivo_(item, colStatus.id))
+    .map(item => ({
+      grupo: grupo.title,
+      nome: item.name,
+      colunas: item.column_values
+    }));
+
+  escreverNaPlanilha_(colunas, itensAtivos);
+
+  Logger.log('Concluído. ' + itensAtivos.length + ' de ' + itensDoGrupo.length + ' item(ns) ativos de "' + grupo.title + '" adicionados.');
+}
