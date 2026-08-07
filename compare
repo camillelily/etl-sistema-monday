@@ -1,0 +1,369 @@
+const ID_PLANILHA_QBEM = "ID_PLANILHA_QBEM";
+const ID_PLANILHA_MONDAY = "ID_PLANILHA_MONDAY";
+const ID_PLANILHA_RESULTADO = "ID_PLANILHA_RESULTADO";
+
+const ABA_QBEM = "EstipulantesID_DO_PERFIL"; // trocar ID_DO_PERFIL pelo id do gerente desejado, ex: "Estipulantes8054"
+
+const ABA_MONDAY = "Monday";
+const ABA_RESULTADO = "DIFERENÇAS";
+
+
+function limparCnpj_(cnpj) {
+  return String(cnpj).replace(/\D/g, "");
+}
+
+function formatarCnpj_(cnpj) {
+
+  cnpj = limparCnpj_(cnpj);
+
+  if (cnpj.length !== 14) {
+    return cnpj;
+  }
+
+  return cnpj.replace(
+    /^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/,
+    "$1.$2.$3/$4-$5"
+  );
+
+}
+
+function normalizarNomeEstipulante_(nome) {
+  return String(nome)
+    .toUpperCase()
+    .trim()
+    .replace(/\s*-\s*\d{1,4}\s*$/, "")
+    .replace(/\s+/g, " ");
+}
+
+function cruzarDiferencas() {
+
+
+  // ABRE AS PLANILHAS
+  const ssQbem = SpreadsheetApp.openById(ID_PLANILHA_QBEM);
+  const ssMonday = SpreadsheetApp.openById(ID_PLANILHA_MONDAY);
+  const ssResultado = SpreadsheetApp.openById(ID_PLANILHA_RESULTADO);
+
+
+  // QBEM
+  const abaQbem = ssQbem.getSheetByName(ABA_QBEM);
+
+  if (!abaQbem) {
+    throw new Error("Aba " + ABA_QBEM + " não encontrada no QBEM.");
+  }
+
+
+  const dadosQbem = abaQbem.getDataRange().getValues();
+
+  const listaQbem = [];
+  const listaQbemSufixo = []; // linhas sem CNPJ completo, só "nome - NN" (não dá pra comparar por CNPJ)
+  const listaQbemSufixoInvalido = []; // sufixo "- NN" não bate com os 2 últimos dígitos do próprio CNPJ
+
+  dadosQbem
+    .slice(1)
+    .filter(linha => linha[0] && linha[1])
+    .forEach(linha => {
+
+      const id = linha[0];
+      const nomeCnpj = String(linha[1]).trim();
+
+      const cnpjMatch = nomeCnpj.match(
+        /(\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2})$/
+      );
+
+      if (cnpjMatch) {
+
+        const cnpjLimpo = limparCnpj_(cnpjMatch[1]);
+        if (cnpjLimpo.length !== 14) return;
+
+        // remove o CNPJ completo do final
+        let nomeSemCnpj = nomeCnpj
+          .replace(cnpjMatch[1], "")
+          .replace(/-\s*$/, "")
+          .trim();
+
+        // verifica se ainda sobrou um sufixo tipo "- 54" antes do CNPJ
+        const sufixoMatch = nomeSemCnpj.match(/^(.*?)\s*-\s*(\d{1,4})\s*$/);
+
+        if (sufixoMatch) {
+
+          const nomeLimpo = sufixoMatch[1].trim();
+          const sufixo = sufixoMatch[2];
+          const sufixoBate = cnpjLimpo.endsWith(sufixo);
+
+          if (sufixoBate) {
+            // sufixo confere com o próprio CNPJ -> segue fluxo normal, usando o nome já limpo
+            listaQbem.push({
+              id: id,
+              nome: nomeLimpo,
+              cnpj: cnpjLimpo,
+              cnpjFormatado: cnpjMatch[1]
+            });
+          } else {
+            // sufixo NÃO confere com o próprio CNPJ -> inconsistência, vai direto pra planilha
+            listaQbemSufixoInvalido.push({
+              id: id,
+              nome: nomeCnpj + " (sufixo -" + sufixo + " não confere com o CNPJ)",
+              cnpjFormatado: cnpjMatch[1]
+            });
+          }
+
+        } else {
+          // não tinha sufixo nenhum, só nome + CNPJ completo -> fluxo normal de sempre
+          listaQbem.push({
+            id: id,
+            nome: nomeSemCnpj,
+            cnpj: cnpjLimpo,
+            cnpjFormatado: cnpjMatch[1]
+          });
+        }
+
+        return;
+      }
+
+      // não achou CNPJ completo -> tenta achar só o sufixo curto (ex: "- 54", sem CNPJ nenhum)
+      const sufixoSoMatch = nomeCnpj.match(/^(.*?)\s*-\s*(\d{1,4})\s*$/);
+      if (sufixoSoMatch) {
+        listaQbemSufixo.push({
+          id: id,
+          nomeBase: sufixoSoMatch[1].trim(),
+          sufixo: sufixoSoMatch[2]
+        });
+      }
+    });
+
+
+  // MONDAY
+  const abaMonday = ssMonday.getSheetByName(ABA_MONDAY);
+
+
+  if (!abaMonday) {
+    throw new Error("Aba Monday não encontrada.");
+  }
+
+  const dadosMonday = abaMonday.getDataRange().getValues();
+
+  const listaMonday = dadosMonday
+    .slice(1)
+    .filter(linha => linha[5])
+    .map(linha => {
+
+
+      return {
+
+        gerente: linha[0],
+        item: linha[1],
+        status: linha[2], // ATIVA OU INATIVA
+        estipulante: linha[3],
+        apolice: linha[4],
+
+        cnpj: limparCnpj_(linha[5]),
+
+        cnpjFormatado: linha[5]
+
+      };
+
+
+    })
+    .filter(item => item.cnpj.length === 14);
+
+
+
+  // COMPARAÇÃO POR CNPJ
+  const chavesQbem = listaQbem.map(item => {
+  return normalizarNomeEstipulante_(item.nome) + "|" + item.cnpj;
+  });
+
+  const chavesMonday = listaMonday.map(item => {
+  return normalizarNomeEstipulante_(item.estipulante) + "|" + item.cnpj;
+  });
+
+
+
+  // QBEM SEM O MONDAY
+
+  const soNoQBem = listaQbem.filter(item => {
+
+  const chave =
+    normalizarNomeEstipulante_(item.nome) + "|" + item.cnpj;
+
+  return !chavesMonday.includes(chave);
+
+});
+
+
+  // adiciona direto nas diferenças: linhas com sufixo "- NN" sem CNPJ nenhum
+  // (não têm CNPJ pra cruzar, então vão direto pra conferência manual)
+
+  listaQbemSufixo.forEach(item => {
+    soNoQBem.push({
+      id: item.id,
+      nome: item.nomeBase + " - " + item.sufixo + " (sem CNPJ completo no registro)",
+      cnpjFormatado: ""
+    });
+  });
+
+  // adiciona direto nas diferenças: sufixo "- NN" que não bate com o próprio CNPJ (inconsistência de cadastro)
+  listaQbemSufixoInvalido.forEach(item => soNoQBem.push(item));
+
+
+
+  // MONDAY SEM O QBEM
+
+  const soNoMonday = listaMonday.filter(item => {
+
+  const chave =
+    normalizarNomeEstipulante_(item.estipulante) + "|" + item.cnpj;
+
+  return !chavesQbem.includes(chave);
+
+});
+
+ 
+  // ESCREVE RESULTADO
+
+  let abaResultado = ssResultado.getSheetByName(ABA_RESULTADO);
+
+
+  if (!abaResultado) {
+
+    abaResultado = ssResultado.insertSheet(ABA_RESULTADO);
+
+  }
+
+  abaResultado.clear();
+
+  let linha = 1;
+
+
+  // QBEM SEM MONDAY
+
+  abaResultado
+    .getRange(linha,1,1,3)
+    .merge()
+    .setValue("QBEM SEM CORRESPONDENTE NO MONDAY")
+    .setFontWeight("bold")
+    .setBackground("#f4cccc");
+
+
+  linha++;
+
+
+  abaResultado
+    .getRange(linha,1,1,3)
+    .setValues([
+      [
+        "ID Estipulante",
+        "Nome",
+        "CNPJ"
+      ]
+    ])
+    .setFontWeight("bold");
+
+
+  linha++;
+
+
+
+  if (soNoQBem.length) {
+
+
+    abaResultado
+      .getRange(
+        linha,
+        1,
+        soNoQBem.length,
+        3
+      )
+      .setValues(
+        soNoQBem.map(item => [
+
+          item.id,
+          item.nome,
+          item.cnpjFormatado
+
+        ])
+      );
+
+
+    linha += soNoQBem.length;
+
+
+  } else {
+
+
+    abaResultado
+      .getRange(linha,1)
+      .setValue("Nenhuma diferença");
+
+
+    linha++;
+
+  }
+
+
+  linha += 2;
+
+
+  // MONDAY SEM QBEM
+
+  abaResultado
+    .getRange(linha,1,1,5)
+    .merge()
+    .setValue("MONDAY SEM CORRESPONDENTE NO QBEM")
+    .setFontWeight("bold")
+    .setBackground("#f4cccc");
+
+  linha++;
+
+  abaResultado
+    .getRange(linha,1,1,5)
+    .setValues([
+      [
+        "Gerente/Grupo",
+        "Item",
+        "Status",
+        "Estipulante",
+        "CNPJ"
+      ]
+    ])
+    .setFontWeight("bold");
+
+  linha++;
+
+  if (soNoMonday.length) {
+
+    abaResultado
+      .getRange(
+        linha,
+        1,
+        soNoMonday.length,
+        5
+      )
+      .setValues(
+        soNoMonday.map(item => [
+          item.gerente,
+          item.item,
+          item.status,
+          item.estipulante,
+          item.cnpjFormatado
+        ])
+      );
+
+    linha += soNoMonday.length;
+
+  } else {
+
+    abaResultado
+      .getRange(linha,1)
+      .setValue("Nenhuma diferença");
+
+    linha++;
+
+  }
+
+  Logger.log(
+    "Concluído. QBEM sem Monday: " + soNoQBem.length +
+    " | Monday sem QBEM: " + soNoMonday.length
+  );
+
+}
