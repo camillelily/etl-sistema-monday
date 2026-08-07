@@ -25,4 +25,4 @@ Observações
 
 Login no Q bem é feito via POST em /Autenticacao.
 
-IDs de planilha, board do Monday e credenciais ficam fora do código-fonte (ver .gitignore).
+IDs de planilha, board do Monday e credenciais ficam fora do código-fonte.
